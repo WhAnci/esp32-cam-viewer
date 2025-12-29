@@ -18,30 +18,33 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
-// 파일 크기 포맷팅
+// 파일 크기 포맷팅 함수
 const formatFileSize = (bytes) => {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 };
 
-// 타임스탬프 포맷팅
+// 타임스탬프 포맷팅 함수
 const formatTimestamp = (timestamp) => {
   return timestamp.toLocaleString('ko-KR', {
+    year: 'numeric',
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
+    second: '2-digit',
   });
 };
 
-// 로딩 오버레이
-function FullScreenLoading({ message = '데이터 확인 중...' }) {
+// ✅ 전체 화면 로딩 오버레이
+function FullScreenLoading({ message = '모니터링 데이터 확인중...' }) {
   return (
     <div className="fixed inset-0 bg-white/90 backdrop-blur-sm flex items-center justify-center z-[9999]">
-      <div className="text-center px-6">
-        <RefreshCw className="w-10 h-10 text-blue-500 animate-spin mx-auto mb-3" />
-        <p className="text-gray-700 font-semibold">{message}</p>
+      <div className="text-center px-6 w-full">
+        <RefreshCw className="w-12 h-12 text-blue-500 animate-spin mx-auto mb-4" />
+        <p className="text-gray-700 text-lg font-semibold">{message}</p>
+        <p className="text-gray-500 text-sm mt-2">잠시만 기다려주세요.</p>
       </div>
     </div>
   );
@@ -56,34 +59,70 @@ export default function S3ImageViewer() {
   const [isDeletingAll, setIsDeletingAll] = useState(false);
   const [error, setError] = useState(null);
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(30);
-  const [stats, setStats] = useState({ lastHour: 0, today: 0, total: 0 });
+  const [stats, setStats] = useState({
+    lastHour: 0,
+    today: 0,
+    total: 0,
+  });
 
-  const s3Client = useMemo(() => new S3Client({
-    region: import.meta.env.VITE_AWS_REGION,
-    credentials: {
-      accessKeyId: import.meta.env.VITE_AWS_ACCESS_KEY_ID,
-      secretAccessKey: import.meta.env.VITE_AWS_SECRET_ACCESS_KEY,
-    },
-  }), []);
+  // S3 클라이언트 설정
+  const s3Client = useMemo(
+    () =>
+      new S3Client({
+        region: import.meta.env.VITE_AWS_REGION,
+        credentials: {
+          accessKeyId: import.meta.env.VITE_AWS_ACCESS_KEY_ID,
+          secretAccessKey: import.meta.env.VITE_AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    []
+  );
 
   const bucketName = import.meta.env.VITE_AWS_BUCKET_NAME;
 
+  // S3에서 이미지 목록 가져오기
   const loadImagesFromS3 = async () => {
+    setError(null);
     try {
-      let allItems = [];
-      let ContinuationToken;
+      let ContinuationToken = undefined;
+      const allItems = [];
       do {
-        const command = new ListObjectsV2Command({ Bucket: bucketName, ContinuationToken });
+        const command = new ListObjectsV2Command({
+          Bucket: bucketName,
+          ContinuationToken,
+        });
         const response = await s3Client.send(command);
-        if (response.Contents) allItems.push(...response.Contents);
-        ContinuationToken = response.NextContinuationToken;
+        if (response.Contents?.length) {
+          allItems.push(...response.Contents);
+        }
+        ContinuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
       } while (ContinuationToken);
 
+      if (!allItems.length) {
+        setImages([]);
+        setStats({ lastHour: 0, today: 0, total: 0 });
+        return;
+      }
+
       const imagePromises = allItems
-        .filter(item => /\.(jpg|jpeg)$/i.test(item.Key))
+        .filter((item) => {
+          const key = (item.Key || '').toLowerCase();
+          return key.endsWith('.jpg') || key.endsWith('.jpeg');
+        })
         .map(async (item) => {
-          const url = await getSignedUrl(s3Client, new GetObjectCommand({ Bucket: bucketName, Key: item.Key }), { expiresIn: 3600 });
-          return { id: item.Key, key: item.Key, url, name: item.Key.split('/').pop(), timestamp: item.LastModified, size: formatFileSize(item.Size) };
+          const getCommand = new GetObjectCommand({
+            Bucket: bucketName,
+            Key: item.Key,
+          });
+          const url = await getSignedUrl(s3Client, getCommand, { expiresIn: 3600 });
+          return {
+            id: item.Key,
+            key: item.Key,
+            url,
+            name: item.Key.split('/').pop(),
+            timestamp: item.LastModified,
+            size: formatFileSize(item.Size),
+          };
         });
 
       const imageList = await Promise.all(imagePromises);
@@ -91,23 +130,39 @@ export default function S3ImageViewer() {
       setImages(imageList);
 
       const now = Date.now();
-      const oneHourAgo = now - 3600000;
+      const oneHourAgo = now - 60 * 60 * 1000;
       const todayStart = new Date().setHours(0, 0, 0, 0);
 
       setStats({
-        lastHour: imageList.filter(img => img.timestamp.getTime() > oneHourAgo).length,
-        today: imageList.filter(img => img.timestamp.getTime() > todayStart).length,
+        lastHour: imageList.filter((img) => img.timestamp.getTime() > oneHourAgo).length,
+        today: imageList.filter((img) => img.timestamp.getTime() > todayStart).length,
         total: imageList.length,
       });
     } catch (err) {
-      setError('데이터를 불러오지 못했습니다.');
+      console.error('S3 로딩 에러:', err);
+      setError('S3에서 이미지를 불러오는데 실패했습니다.');
     } finally {
       setIsLoading(false);
     }
   };
 
+  const handleDownload = async (img) => {
+    try {
+      const response = await fetch(img.url);
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = img.name;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (err) { alert('다운로드 실패'); }
+  };
+
   const handleDelete = async (img) => {
-    if (!confirm('삭제하시겠습니까?')) return;
+    if (!confirm(`"${img.name}" 파일을 삭제하시겠습니까?`)) return;
     try {
       setIsLoading(true);
       await s3Client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: img.key }));
@@ -118,13 +173,14 @@ export default function S3ImageViewer() {
   };
 
   const deleteAllImages = async () => {
-    if (!confirm('모든 사진을 삭제하시겠습니까?')) return;
+    if (!confirm('사진을 전체 삭제하시겠습니까?')) return;
     try {
       setIsDeletingAll(true);
       setIsLoading(true);
       for (const img of images) {
         await s3Client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: img.key }));
       }
+      alert('전체 삭제 완료');
       await loadImagesFromS3();
     } catch (e) { alert('전체 삭제 실패'); }
     finally { setIsDeletingAll(false); setIsLoading(false); }
@@ -133,7 +189,9 @@ export default function S3ImageViewer() {
   useEffect(() => {
     loadImagesFromS3();
     if (refreshIntervalSec === 0) return;
-    const interval = setInterval(() => { if (!isDeletingAll) loadImagesFromS3(); }, refreshIntervalSec * 1000);
+    const interval = setInterval(() => {
+      if (!isDeletingAll) loadImagesFromS3();
+    }, refreshIntervalSec * 1000);
     return () => clearInterval(interval);
   }, [refreshIntervalSec, isDeletingAll]);
 
@@ -148,112 +206,139 @@ export default function S3ImageViewer() {
     return filtered;
   }, [images, filterDate, sortBy]);
 
-  if (isLoading && images.length === 0) return <FullScreenLoading />;
+  if (isLoading && images.length === 0) return <FullScreenLoading message="모니터링 데이터 로딩 중..." />;
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-800 flex flex-col w-full font-sans">
-      {(isLoading || isDeletingAll) && images.length > 0 && <FullScreenLoading message={isDeletingAll ? "삭제 중..." : "새로고침 중..."} />}
+    <div className="min-h-screen bg-white text-gray-800 flex flex-col w-full overflow-x-hidden">
+      {(isLoading || isDeletingAll) && images.length > 0 && (
+        <FullScreenLoading message={isDeletingAll ? '사진 전체 삭제중...' : '모니터링 데이터 확인중...'} />
+      )}
 
-      {/* 헤더: 모바일 최적화 */}
-      <header className="bg-white shadow-sm border-b sticky top-0 z-40">
-        <div className="p-3">
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <div className="bg-blue-600 p-1.5 rounded-lg shadow-sm">
-                  <Shield className="w-5 h-5 text-white" />
-                </div>
-                <div>
-                  <h1 className="text-lg font-extrabold text-blue-700 leading-none">공마고</h1>
-                  <span className="text-[10px] text-gray-400 font-medium">REFRIGERATOR MONITOR</span>
-                </div>
+      {/* 헤더 */}
+      <header className="bg-white shadow-lg border-b border-blue-200 sticky top-0 z-40">
+        <div className="px-4 md:px-12 py-4">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className="bg-blue-600 p-2 rounded-lg shadow-md shrink-0">
+                <Shield className="w-6 h-6 md:w-7 md:h-7 text-white" />
               </div>
-              <button onClick={() => loadImagesFromS3()} className="p-2 text-blue-600 active:scale-95 transition-transform">
-                <RefreshCw className={`w-5 h-5 ${isLoading ? 'animate-spin' : ''}`} />
-              </button>
+              <div>
+                <h1 className="text-xl md:text-3xl font-extrabold text-blue-700 tracking-tight whitespace-nowrap">
+                  공마고의 도둑들
+                </h1>
+                <p className="text-[10px] md:text-sm text-gray-500 font-medium whitespace-nowrap">
+                  REFRIGERATOR ACCESS LOGS MONITORING
+                </p>
+              </div>
             </div>
 
-            <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar">
-              <button onClick={deleteAllImages} className="whitespace-nowrap flex items-center gap-1.5 bg-red-50 text-red-600 px-3 py-1.5 rounded-full text-xs font-bold border border-red-100">
-                <Trash2 className="w-3.5 h-3.5" /> 사진 전체 삭제
-              </button>
-              <div className="flex items-center gap-1 bg-gray-100 px-3 py-1.5 rounded-full text-xs font-bold text-gray-600 border border-gray-200">
-                <Settings className="w-3.5 h-3.5" />
-                <select value={refreshIntervalSec} onChange={(e) => setRefreshIntervalSec(Number(e.target.value))} className="bg-transparent outline-none">
-                  <option value={0}>수동</option>
+            <div className="flex items-center gap-2 md:gap-4 overflow-x-auto no-scrollbar pb-1 md:pb-0">
+              <div className="flex items-center gap-2 border border-gray-300 rounded-lg px-3 py-2 bg-white text-xs md:text-sm shrink-0">
+                <Settings className="w-4 h-4 text-gray-600" />
+                <span className="hidden sm:inline text-gray-700 font-medium">자동 새로고침:</span>
+                <select
+                  value={refreshIntervalSec}
+                  onChange={(e) => setRefreshIntervalSec(Number(e.target.value))}
+                  className="bg-transparent outline-none cursor-pointer font-bold text-blue-600"
+                >
+                  <option value={0}>정지</option>
+                  <option value={5}>5초</option>
                   <option value={10}>10초</option>
+                  <option value={15}>15초</option>
                   <option value={30}>30초</option>
                 </select>
               </div>
+
+              <button onClick={deleteAllImages} className="whitespace-nowrap flex items-center gap-2 bg-red-600 text-white px-4 py-2.5 rounded-lg shadow-md hover:bg-red-700 font-semibold text-xs md:text-sm transition-all active:scale-95">
+                <Trash2 className="w-4 h-4" /> 전체 삭제
+              </button>
+
+              <button onClick={() => loadImagesFromS3()} className="whitespace-nowrap flex items-center gap-2 bg-blue-600 text-white px-4 py-2.5 rounded-lg shadow-md hover:bg-blue-700 font-semibold text-xs md:text-sm transition-all active:scale-95">
+                <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin' : ''}`} />
+                <span className="hidden xs:inline">새로고침</span>
+              </button>
             </div>
           </div>
         </div>
       </header>
 
-      <main className="p-3 flex-grow">
-        {/* 경고문 축소 */}
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 flex gap-2 items-start shadow-sm">
-          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-          <p className="text-[11px] text-amber-900 leading-snug font-medium">
-            비인가 데이터 접근 시 법적 처벌을 받을 수 있습니다.
-          </p>
+      {/* 메인 컨텐츠 */}
+      <main className="p-4 md:p-8 w-full flex-grow max-w-[2000px] mx-auto">
+        {/* 경고 배너 */}
+        <div className="bg-yellow-50 border border-yellow-300 rounded-lg p-3 md:p-4 mb-6 flex items-start gap-3 w-full shadow-sm">
+          <AlertTriangle className="w-5 h-5 text-yellow-600 shrink-0 mt-0.5" />
+          <div>
+            <p className="text-yellow-800 font-bold text-sm md:text-lg">경고: 용도 외 사용금지</p>
+            <p className="text-gray-600 text-[11px] md:text-sm">
+              본 시스템의 기록은 모니터링 될 수 있으며, 불법적 사용 시 처벌받을 수 있습니다.
+            </p>
+          </div>
         </div>
 
-        {/* 통계 카드: 슬림형 */}
-        <div className="grid grid-cols-3 gap-2 mb-4">
+        {/* 통계 카드 */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6 mb-8">
           {[
-            { label: '최근', val: stats.lastHour, key: 'lastHour', icon: Zap },
-            { label: '오늘', val: stats.today, key: 'today', icon: Calendar },
-            { label: '전체', val: stats.total, key: 'all', icon: Shield }
+            { label: '최근 1시간 (ALERT)', val: stats.lastHour, key: 'lastHour', icon: Zap, sub: 'LAST 60 MINUTES' },
+            { label: '오늘 기록 (TODAY)', val: stats.today, key: 'today', icon: Calendar, sub: 'TODAY RECORDS' },
+            { label: '전체 기록 (TOTAL)', val: stats.total, key: 'all', icon: Shield, sub: 'ALL TIME RECORDS' }
           ].map((item) => (
             <button
               key={item.key}
               onClick={() => setFilterDate(item.key)}
-              className={`p-2.5 rounded-xl border text-left transition-all ${filterDate === item.key ? 'bg-blue-600 border-blue-600 text-white shadow-md' : 'bg-white border-gray-200 text-gray-600'}`}
+              className={`bg-white border rounded-xl p-4 md:p-6 shadow-lg text-left transition-all ${
+                filterDate === item.key ? 'border-blue-600 ring-4 ring-blue-100' : 'border-gray-200 hover:border-blue-200'
+              }`}
             >
-              <div className="flex justify-between items-start mb-1">
-                <span className="text-[10px] font-bold opacity-80 uppercase">{item.label}</span>
-                <item.icon className={`w-3 h-3 ${filterDate === item.key ? 'text-blue-100' : 'text-gray-400'}`} />
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-gray-600 text-[10px] md:text-sm font-medium">{item.label}</span>
+                <item.icon className={`w-5 h-5 ${filterDate === item.key ? 'text-blue-600' : 'text-gray-400'}`} />
               </div>
-              <div className="text-xl font-black leading-none">{item.val}</div>
+              <div className="text-2xl md:text-4xl font-extrabold text-blue-700 mb-1">{item.val}건</div>
+              <div className="text-gray-400 text-[8px] md:text-xs font-semibold">{item.sub}</div>
             </button>
           ))}
         </div>
 
         {/* 필터 바 */}
-        <div className="flex justify-between items-center mb-3 px-1">
-          <div className="flex items-center gap-1 text-[11px] font-bold text-gray-500">
-            <Clock className="w-3 h-3" />
-            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className="bg-transparent border-none p-0 outline-none text-blue-600">
-              <option value="newest">최신순</option>
-              <option value="oldest">과거순</option>
+        <div className="bg-white border border-gray-200 rounded-lg p-3 md:p-4 mb-6 flex items-center justify-between shadow-sm">
+          <div className="flex items-center gap-2">
+            <Clock className="w-4 h-4 text-gray-500" />
+            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className="text-xs md:text-sm font-bold text-gray-700 bg-transparent outline-none cursor-pointer">
+              <option value="newest">최신순 정렬</option>
+              <option value="oldest">오래된순 정렬</option>
+              <option value="name">파일명순 정렬</option>
             </select>
           </div>
-          <span className="text-[11px] font-bold text-gray-400">{displayImages.length}개의 기록</span>
+          <div className="text-[10px] md:text-sm text-gray-500 font-semibold">
+            표시 중: <span className="text-blue-600">{displayImages.length}개</span>
+          </div>
         </div>
 
-        {/* 이미지 그리드: 모바일 2열 */}
+        {/* 이미지 그리드 */}
         {displayImages.length === 0 ? (
-          <div className="py-20 text-center bg-white rounded-2xl border-2 border-dashed border-gray-100">
-            <Shield className="w-12 h-12 text-gray-200 mx-auto mb-2" />
-            <p className="text-sm font-bold text-gray-400">데이터가 없습니다</p>
+          <div className="bg-white border border-gray-200 rounded-2xl p-12 text-center shadow-md">
+            <Shield className="w-16 h-16 text-gray-200 mx-auto mb-4" />
+            <p className="text-gray-500 font-bold">기록된 데이터가 없습니다.</p>
           </div>
         ) : (
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-3 md:gap-5">
             {displayImages.map((img) => (
-              <div key={img.id} onClick={() => setSelectedImage(img)} className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm active:scale-95 transition-all">
-                <div className="aspect-[4/3] relative bg-gray-100">
+              <div key={img.id} onClick={() => setSelectedImage(img)} className="bg-white border rounded-xl overflow-hidden shadow-md hover:shadow-xl transition-all cursor-pointer group active:scale-95 md:active:scale-100">
+                <div className="aspect-video bg-gray-100 relative">
                   <img src={img.url} alt="" className="w-full h-full object-cover" loading="lazy" />
                   {Date.now() - img.timestamp.getTime() < 3600000 && (
-                    <div className="absolute top-1.5 right-1.5 bg-red-600 text-white text-[8px] px-1.5 py-0.5 rounded-md font-black animate-pulse">NEW</div>
+                    <div className="absolute top-2 right-2 bg-red-600 text-white text-[8px] md:text-xs px-2 py-0.5 rounded-full font-bold animate-pulse shadow-md">ALERT</div>
                   )}
                 </div>
-                <div className="p-2">
-                  <p className="text-[10px] font-bold text-gray-700 truncate mb-1">{img.name}</p>
-                  <p className="text-[9px] text-gray-400 font-medium mb-2">{formatTimestamp(img.timestamp)}</p>
-                  <div className="flex gap-1.5">
-                    <button onClick={(e) => { e.stopPropagation(); handleDelete(img); }} className="flex-1 bg-gray-50 py-1.5 rounded-md flex justify-center border border-gray-100">
-                      <Trash2 className="w-3.5 h-3.5 text-gray-400" />
+                <div className="p-3">
+                  <p className="text-[10px] md:text-sm font-mono font-bold text-gray-800 truncate mb-1">{img.name}</p>
+                  <p className="text-[9px] md:text-xs text-gray-400 mb-3">{formatTimestamp(img.timestamp)}</p>
+                  <div className="flex gap-2">
+                    <button onClick={(e) => { e.stopPropagation(); handleDownload(img); }} className="flex-1 bg-gray-50 py-2 rounded-lg flex justify-center border border-gray-200">
+                      <Download className="w-3.5 h-3.5 text-gray-600" />
+                    </button>
+                    <button onClick={(e) => { e.stopPropagation(); handleDelete(img); }} className="bg-red-500 px-3 py-2 rounded-lg flex justify-center shadow-sm">
+                      <Trash2 className="w-3.5 h-3.5 text-white" />
                     </button>
                   </div>
                 </div>
@@ -263,26 +348,28 @@ export default function S3ImageViewer() {
         )}
       </main>
 
-      {/* 상세 모달: 모바일 전면 */}
+      {/* 이미지 상세 모달 */}
       {selectedImage && (
-        <div className="fixed inset-0 bg-black/95 z-[100] flex flex-col pt-safe" onClick={() => setSelectedImage(null)}>
-          <div className="p-4 flex justify-between items-center text-white">
-            <div className="truncate pr-4">
-              <p className="text-sm font-bold truncate">{selectedImage.name}</p>
-              <p className="text-[10px] opacity-60">{formatTimestamp(selectedImage.timestamp)}</p>
+        <div className="fixed inset-0 bg-black/90 flex items-center justify-center p-4 z-[100]" onClick={() => setSelectedImage(null)}>
+          <div className="bg-white rounded-2xl w-full max-w-5xl max-h-[95vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="p-4 border-b flex items-center justify-between">
+              <div className="truncate pr-4">
+                <h3 className="font-bold text-sm md:text-lg truncate">{selectedImage.name}</h3>
+                <p className="text-[10px] md:text-xs text-gray-400">{formatTimestamp(selectedImage.timestamp)} · {selectedImage.size}</p>
+              </div>
+              <button onClick={() => setSelectedImage(null)} className="text-2xl p-2 text-gray-400 hover:text-black">&times;</button>
             </div>
-            <button className="text-2xl font-light">&times;</button>
-          </div>
-          <div className="flex-grow flex items-center justify-center p-2">
-            <img src={selectedImage.url} className="max-w-full max-h-full object-contain shadow-2xl" alt="" />
-          </div>
-          <div className="p-4 grid grid-cols-2 gap-3" onClick={e => e.stopPropagation()}>
-            <button onClick={() => window.open(selectedImage.url)} className="bg-white text-black py-3 rounded-xl font-bold text-sm flex justify-center items-center gap-2">
-              <Download className="w-4 h-4" /> 다운로드
-            </button>
-            <button onClick={() => handleDelete(selectedImage)} className="bg-red-600 text-white py-3 rounded-xl font-bold text-sm flex justify-center items-center gap-2">
-              <Trash2 className="w-4 h-4" /> 삭제하기
-            </button>
+            <div className="flex-grow bg-gray-100 overflow-hidden flex items-center justify-center">
+              <img src={selectedImage.url} className="max-w-full max-h-full object-contain" alt="" />
+            </div>
+            <div className="p-4 grid grid-cols-2 gap-3">
+              <button onClick={() => handleDownload(selectedImage)} className="bg-blue-600 text-white py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2">
+                <Download className="w-4 h-4" /> 다운로드
+              </button>
+              <button onClick={() => handleDelete(selectedImage)} className="bg-red-600 text-white py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2">
+                <Trash2 className="w-4 h-4" /> 삭제
+              </button>
+            </div>
           </div>
         </div>
       )}
