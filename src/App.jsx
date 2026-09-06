@@ -37,6 +37,16 @@ const formatTimestamp = (timestamp) => {
   });
 };
 
+const getDemoImage = () => ({
+  id: 'demo-capture',
+  key: 'demo-capture',
+  url: '/demo-capture.png',
+  name: 'demo-capture.png',
+  timestamp: new Date('2026-09-07T12:00:00+09:00'),
+  size: 'demo',
+  isDemo: true,
+});
+
 // ✅ 전체 화면 로딩 오버레이
 function FullScreenLoading({ message = '모니터링 데이터 확인중...' }) {
   return (
@@ -99,8 +109,8 @@ export default function S3ImageViewer() {
       } while (ContinuationToken);
 
       if (!allItems.length) {
-        setImages([]);
-        setStats({ lastHour: 0, today: 0, total: 0 });
+        setImages([getDemoImage()]);
+        setStats({ lastHour: 0, today: 0, total: 1 });
         return;
       }
 
@@ -127,7 +137,7 @@ export default function S3ImageViewer() {
 
       const imageList = await Promise.all(imagePromises);
       imageList.sort((a, b) => b.timestamp - a.timestamp);
-      setImages(imageList);
+      setImages([getDemoImage(), ...imageList]);
 
       const now = Date.now();
       const oneHourAgo = now - 60 * 60 * 1000;
@@ -136,11 +146,13 @@ export default function S3ImageViewer() {
       setStats({
         lastHour: imageList.filter((img) => img.timestamp.getTime() > oneHourAgo).length,
         today: imageList.filter((img) => img.timestamp.getTime() > todayStart).length,
-        total: imageList.length,
+        total: imageList.length + 1,
       });
     } catch (err) {
       console.error('S3 로딩 에러:', err);
       setError('S3에서 이미지를 불러오는데 실패했습니다.');
+      setImages([getDemoImage()]);
+      setStats({ lastHour: 0, today: 0, total: 1 });
     } finally {
       setIsLoading(false);
     }
@@ -162,6 +174,10 @@ export default function S3ImageViewer() {
   };
 
   const handleDelete = async (img) => {
+    if (img.isDemo) {
+      alert('기본 데모 이미지는 삭제할 수 없습니다.');
+      return;
+    }
     if (!confirm(`"${img.name}" 파일을 삭제하시겠습니까?`)) return;
     try {
       setIsLoading(true);
@@ -177,7 +193,7 @@ export default function S3ImageViewer() {
     try {
       setIsDeletingAll(true);
       setIsLoading(true);
-      for (const img of images) {
+      for (const img of images.filter((item) => !item.isDemo)) {
         await s3Client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: img.key }));
       }
       alert('전체 삭제 완료');
